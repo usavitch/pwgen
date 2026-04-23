@@ -1,6 +1,6 @@
 ; ======================================================================
 ; КРИПТОСТОЙКИЙ ГЕНЕРАТОР ПАРОЛЕЙ (NASM x86-64)
-; Финальная версия: безопасный стек, проверка read, очистка всего
+; Финальная версия со всеми исправлениями
 ; ======================================================================
 
 %define SYS_READ 0
@@ -17,7 +17,7 @@
 %define CUPS_SIZE (CUPS_X * CUPS_Y * CUPS_DEPTH)
 %define BALLS_PER_CUP 16
 %define MAX_RETRIES 65536
-%define STACK_CLEAN_SIZE 256
+%define STACK_CLEAN_SIZE 512
 
 %macro PUSH_CALLEE 0
 push rbx
@@ -65,6 +65,7 @@ charset db '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^
 charset_end db 0
 urandom_path db '/dev/urandom',0
 cpu_rdrand db 0
+cpu_rdseed db 0
 err_urandom_msg db 'Fatal: Cannot read /dev/urandom',10
 err_urandom_len equ $-err_urandom_msg
 no_rdrand_msg db 'Fatal: RDRAND not supported',10
@@ -194,6 +195,9 @@ fatal_exit:
     mov     edi, 1
     syscall
 
+; ======================================================================
+; ПРОВЕРКА CPUID (RDRAND, RDSEED)
+; ======================================================================
 check_cpu_features:
     PUSH_CALLEE
     mov     eax, 1
@@ -202,11 +206,20 @@ check_cpu_features:
     jz      .no_rdrand
     mov     byte [cpu_rdrand], 1
 .no_rdrand:
+    test    ebx, 1<<18
+    jz      .no_rdseed
+    mov     byte [cpu_rdseed], 1
+.no_rdseed:
     POP_CALLEE
     ret
 
+; ======================================================================
+; ИНИЦИАЛИЗАЦИЯ ЭНТРОПИИ (с циклом чтения)
+; ======================================================================
 init_entropy:
     PUSH_CALLEE
+    
+    ; Пытаемся открыть /dev/urandom
     mov     eax, SYS_OPEN
     lea     rdi, [urandom_path]
     xor     esi, esi
@@ -214,19 +227,37 @@ init_entropy:
     test    eax, eax
     js      .fallback_to_rdrand
 
-    mov     edi, eax
-    xor     eax, eax
-    lea     rsi, [state]
-    mov     edx, 64
+    mov     r12d, eax              ; сохраняем fd
+    lea     r13, [state]           ; буфер для чтения
+    mov     r14d, 64               ; осталось прочитать
+    
+.read_loop:
+    mov     eax, SYS_READ
+    mov     edi, r12d
+    mov     rsi, r13
+    mov     edx, r14d
     syscall
-    cmp     rax, 64
-    jb      read_error_exit
-
+    test    rax, rax
+    jz      .urandom_failed
+    js      .urandom_failed
+    
+    sub     r14d, eax              ; уменьшаем счётчик
+    add     r13, rax               ; двигаем указатель
+    jz      .close_and_done        ; прочитали всё
+    
+    cmp     r14d, 0
+    jne     .read_loop
+    
+.close_and_done:
     mov     eax, SYS_CLOSE
+    mov     edi, r12d
     syscall
     jmp     .done
 
 .urandom_failed:
+    mov     eax, SYS_CLOSE
+    mov     edi, r12d
+    syscall
     mov     eax, SYS_WRITE
     mov     edi, STDOUT
     lea     rsi, [err_urandom_msg]
@@ -258,13 +289,23 @@ init_entropy:
     POP_CALLEE
     ret
 
+; ======================================================================
+; АППАРАТНЫЙ СЛУЧАЙНЫЙ БАЙТ (RDRAND с fallback на RDSEED)
+; ======================================================================
 get_hw_random:
     push    rcx
     mov     ecx, 10
 .retry:
     cmp     byte [cpu_rdrand], 1
-    jne     .fail
+    jne     .try_rdseed
     rdrand  eax
+    jnc     .next_attempt
+    pop     rcx
+    ret
+.try_rdseed:
+    cmp     byte [cpu_rdseed], 1
+    jne     .fail
+    rdseed  eax
     jnc     .next_attempt
     pop     rcx
     ret
@@ -276,6 +317,9 @@ get_hw_random:
     xor     eax, eax
     ret
 
+; ======================================================================
+; СЛУЧАЙНЫЙ БАЙТ (0-255)
+; ======================================================================
 get_random_byte:
     push    rcx
     call    get_hw_random
@@ -283,6 +327,9 @@ get_random_byte:
     pop     rcx
     ret
 
+; ======================================================================
+; ИНИЦИАЛИЗАЦИЯ КУБА
+; ======================================================================
 init_cups:
     PUSH_CALLEE
     
@@ -337,6 +384,9 @@ init_cups:
     POP_CALLEE
     ret
 
+; ======================================================================
+; РАЗБРАСЫВАНИЕ ШАРИКОВ
+; ======================================================================
 collect_and_splash:
     PUSH_CALLEE
     mov     r12d, 10
@@ -375,6 +425,9 @@ collect_and_splash:
     POP_CALLEE
     ret
 
+; ======================================================================
+; ИЗВЛЕЧЕНИЕ ШАРИКОВ
+; ======================================================================
 sip_from_cups:
     PUSH_CALLEE
     mov     r12d, 8
@@ -424,6 +477,9 @@ sip_from_cups:
     POP_CALLEE
     ret
 
+; ======================================================================
+; СЛУЧАЙНАЯ ПОЗИЦИЯ СТАКАНЧИКА
+; ======================================================================
 get_random_position:
     PUSH_CALLEE
     call    chacha20_block_sse
@@ -435,29 +491,43 @@ get_random_position:
     POP_CALLEE
     ret
 
+; ======================================================================
+; СБОР ОДНОГО ИСТОЧНИКА ЭНТРОПИИ (без rdtscp)
+; ======================================================================
 collect_single_entropy:
     push    rax
     push    rcx
     push    rdx
+    
     call    get_hw_random
     mov     ebx, eax
-    rdtscp
+    
+    ; Используем rdtsc с lfence вместо rdtscp
+    lfence
+    rdtsc
+    lfence
     xor     ebx, eax
-    xor     ebx, ecx
+    xor     ebx, edx
+    
     mov     eax, SYS_CLOCK_GETTIME
     mov     edi, 1
     lea     rsi, [time_buf]
     syscall
     mov     eax, [time_buf+8]
     xor     ebx, eax
+    
     pushfq
     pop     rax
     xor     ebx, eax
+    
     pop     rdx
     pop     rcx
     pop     rax
     ret
 
+; ======================================================================
+; ЗАПОЛНЕНИЕ ПУЛА 64 БАЙТАМИ
+; ======================================================================
 refill_pool:
     PUSH_CALLEE
     call    collect_and_splash
@@ -493,6 +563,9 @@ refill_pool:
     POP_CALLEE
     ret
 
+; ======================================================================
+; CHACHA20 BLOCK (SSE)
+; ======================================================================
 chacha20_block_sse:
     PUSH_CALLEE
     movdqa  xmm0, [rot16_mask]
@@ -515,16 +588,10 @@ chacha20_block_sse:
     ret
 
 ; ======================================================================
-; ОЧИСТКА ПАМЯТИ (исправленная версия с безопасной очисткой стека)
+; ОЧИСТКА ПАМЯТИ
 ; ======================================================================
 ; ======================================================================
-; ОЧИСТКА ПАМЯТИ (исправленная версия с безопасной очисткой стека)
-; ======================================================================
-; ======================================================================
-; ОЧИСТКА ПАМЯТИ (ФИНАЛЬНАЯ ВЕРСИЯ — БЕЗОПАСНАЯ ОЧИСТКА СТЕКА)
-; ======================================================================
-; ======================================================================
-; ОЧИСТКА ПАМЯТИ (ПЕРЕПИСАННАЯ ВЕРСИЯ)
+; ОЧИСТКА ПАМЯТИ (ИСПРАВЛЕНО — БЕЗ ТРОГАНИЯ СТЕКА)
 ; ======================================================================
 burn_memory:
     PUSH_CALLEE
@@ -532,41 +599,27 @@ burn_memory:
     ; 1. Зачистка всех статических буферов
     xor     eax, eax
     
-    ; state + state_save + rand_pool = 16+16+16 = 48 dwords
     lea     rdi, [state]
     mov     ecx, 48
     rep stosd
     
-    ; cups - 4096 dwords
     lea     rdi, [cups]
     mov     ecx, CUPS_SIZE
     rep stosd
     
-    ; cup_ball_count - 256 bytes
     lea     rdi, [cup_ball_count]
     mov     ecx, CUPS_X * CUPS_Y
     rep stosb
     
-    ; pass - 64 bytes
     lea     rdi, [pass]
     mov     ecx, 64
     rep stosb
     
-    ; Обнуляем счётчики
     mov     dword [pool_pos], 0
     mov     dword [cups_fill_count], 0
     mov     dword [cups_take_count], 0
     
-    ; 2. Зачистка стека (безопасный метод)
-    ; Затираем 512 байт ВЫШЕ текущего RSP
-    mov     rdi, rsp
-    mov     rcx, 64
-    xor     eax, eax
-.stack_loop:
-    mov     [rdi + rcx*8], rax
-    loop    .stack_loop
-    
-    ; 3. Зачистка XMM регистров
+    ; 2. Зачистка XMM регистров
     pxor    xmm0,  xmm0
     pxor    xmm1,  xmm1
     pxor    xmm2,  xmm2
@@ -584,7 +637,7 @@ burn_memory:
     pxor    xmm14, xmm14
     pxor    xmm15, xmm15
     
-    ; 4. Финальное обнуление рабочих регистров
+    ; 3. Финальное обнуление рабочих регистров
     xor     rbx, rbx
     xor     rcx, rcx
     xor     rdx, rdx
