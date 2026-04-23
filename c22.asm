@@ -216,6 +216,9 @@ check_cpu_features:
 ; ======================================================================
 ; ИНИЦИАЛИЗАЦИЯ ЭНТРОПИИ (с циклом чтения)
 ; ======================================================================
+; ======================================================================
+; ИНИЦИАЛИЗАЦИЯ ЭНТРОПИИ (с циклом чтения, устойчивым к прерываниям)
+; ======================================================================
 init_entropy:
     PUSH_CALLEE
     
@@ -237,17 +240,29 @@ init_entropy:
     mov     rsi, r13
     mov     edx, r14d
     syscall
-    test    rax, rax
-    jz      .urandom_failed
-    js      .urandom_failed
     
-    sub     r14d, eax              ; уменьшаем счётчик
+    ; Проверяем на ошибку
+    test    rax, rax
+    jz      .urandom_failed        ; EOF — не должно быть, но обрабатываем
+    js      .check_eintr           ; отрицательное значение — возможно, EINTR
+    
+    ; Успешно прочитано rax байт
+    sub     r14d, eax              ; уменьшаем счётчик оставшихся байт
     add     r13, rax               ; двигаем указатель
-    jz      .close_and_done        ; прочитали всё
     
     cmp     r14d, 0
-    jne     .read_loop
+    jne     .read_loop             ; читаем ещё, если не всё
     
+    ; Прочитано ровно 64 байта
+    jmp     .close_and_done
+
+.check_eintr:
+    ; EINTR = -4 (в rax будет -4 после syscall)
+    cmp     eax, -4                ; EINTR
+    je      .read_loop             ; прерывание — повторяем
+    ; Другая ошибка — fallback
+    jmp     .urandom_failed
+
 .close_and_done:
     mov     eax, SYS_CLOSE
     mov     edi, r12d
@@ -258,6 +273,21 @@ init_entropy:
     mov     eax, SYS_CLOSE
     mov     edi, r12d
     syscall
+    
+    ; Пробуем RDRAND перед тем как сдаться
+    cmp     byte [cpu_rdrand], 1
+    jne     .fatal_no_entropy
+    
+    mov     ecx, 16
+    xor     ebx, ebx
+.rdrand_loop:
+    call    get_hw_random
+    mov     [state + rbx*4], eax
+    inc     ebx
+    loop    .rdrand_loop
+    jmp     .done
+
+.fatal_no_entropy:
     mov     eax, SYS_WRITE
     mov     edi, STDOUT
     lea     rsi, [err_urandom_msg]
@@ -270,11 +300,11 @@ init_entropy:
     jne     .no_rdrand
     mov     ecx, 16
     xor     ebx, ebx
-.rdrand_loop:
+.fb_rdrand_loop:
     call    get_hw_random
     mov     [state + rbx*4], eax
     inc     ebx
-    loop    .rdrand_loop
+    loop    .fb_rdrand_loop
     jmp     .done
 
 .no_rdrand:
