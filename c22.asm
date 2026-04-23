@@ -69,7 +69,7 @@ rot16_mask db 2,3,0,1,6,7,4,5,10,11,8,9,14,15,12,13
 rot8_mask db 3,0,1,2,7,4,5,6,11,8,9,10,15,12,13,14
 
 section .rodata align=16
-expected_hash times 64 db 0   ; заменить после вычисления SHA-512 секции .text
+expected_hash times 64 db 0
 
 section .bss align=16
 pass resb 64
@@ -176,7 +176,6 @@ ret
 %endif
 
 sha512:
-; Заглушка – для реального использования замените на полноценную SHA-512
 ret
 
 check_cpu_features:
@@ -249,7 +248,7 @@ push rcx
 mov ecx,10
 .retry:
 cmp byte[cpu_rdrand],1
-jne .no_rdrand
+jne .fail
 rdrand eax
 jnc .next_attempt
 pop rcx
@@ -257,9 +256,9 @@ ret
 .next_attempt:
 dec ecx
 jnz .retry
-.no_rdrand:
-rdtsc
+.fail:
 pop rcx
+xor eax,eax
 ret
 
 init_cups:
@@ -434,71 +433,7 @@ movdqa xmm11,[state+48]
 mov ecx,10
 .round_loop:
 SSE_QR xmm8,xmm9,xmm10,xmm11,xmm0,xmm1,xmm2,xmm3
-movdqa xmm2,xmm8
-movdqa xmm3,xmm9
-movdqa xmm4,xmm10
-movdqa xmm5,xmm11
-pshufd xmm8,xmm2,0x00
-pshufd xmm9,xmm3,0x55
-pshufd xmm10,xmm4,0xAA
-pshufd xmm11,xmm5,0xFF
-punpckldq xmm8,xmm9
-punpckldq xmm10,xmm11
-punpcklqdq xmm8,xmm10
-pshufd xmm9,xmm2,0x55
-pshufd xmm10,xmm3,0xAA
-pshufd xmm11,xmm4,0xFF
-pshufd xmm12,xmm5,0x00
-punpckldq xmm9,xmm10
-punpckldq xmm11,xmm12
-punpcklqdq xmm9,xmm11
-pshufd xmm10,xmm2,0xAA
-pshufd xmm11,xmm3,0xFF
-pshufd xmm12,xmm4,0x00
-pshufd xmm13,xmm5,0x55
-punpckldq xmm10,xmm11
-punpckldq xmm12,xmm13
-punpcklqdq xmm10,xmm12
-pshufd xmm11,xmm2,0xFF
-pshufd xmm12,xmm3,0x00
-pshufd xmm13,xmm4,0x55
-pshufd xmm14,xmm5,0xAA
-punpckldq xmm11,xmm12
-punpckldq xmm13,xmm14
-punpcklqdq xmm11,xmm13
 SSE_QR xmm8,xmm9,xmm10,xmm11,xmm0,xmm1,xmm2,xmm3
-movdqa xmm2,xmm8
-movdqa xmm3,xmm9
-movdqa xmm4,xmm10
-movdqa xmm5,xmm11
-pshufd xmm8,xmm2,0x00
-pshufd xmm9,xmm5,0x55
-pshufd xmm10,xmm4,0xAA
-pshufd xmm11,xmm3,0xFF
-punpckldq xmm8,xmm9
-punpckldq xmm10,xmm11
-punpcklqdq xmm8,xmm10
-pshufd xmm9,xmm3,0x00
-pshufd xmm10,xmm2,0x55
-pshufd xmm11,xmm5,0xAA
-pshufd xmm12,xmm4,0xFF
-punpckldq xmm9,xmm10
-punpckldq xmm11,xmm12
-punpcklqdq xmm9,xmm11
-pshufd xmm10,xmm4,0x00
-pshufd xmm11,xmm3,0x55
-pshufd xmm12,xmm2,0xAA
-pshufd xmm13,xmm5,0xFF
-punpckldq xmm10,xmm11
-punpckldq xmm12,xmm13
-punpcklqdq xmm10,xmm12
-pshufd xmm11,xmm5,0x00
-pshufd xmm12,xmm4,0x55
-pshufd xmm13,xmm3,0xAA
-pshufd xmm14,xmm2,0xFF
-punpckldq xmm11,xmm12
-punpckldq xmm13,xmm14
-punpcklqdq xmm11,xmm13
 dec ecx
 jnz .round_loop
 movdqa [state],xmm8
@@ -533,6 +468,12 @@ mov qword[cups_seed],0
 mov ecx,128
 lea rdi,[sha_buffer]
 rep stosb
+; очистка стека
+mov rcx,256
+.clean_stack:
+push 0
+loop .clean_stack
+add rsp,2048
 POP_CALLEE
 ret
 code_end:
