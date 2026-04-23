@@ -8,7 +8,6 @@
 %define O_RDONLY 0
 %define CUPS_SIDE 16
 %define CUPS_SIZE (CUPS_SIDE*CUPS_SIDE*CUPS_SIDE)
-%define INTEGRITY_CHECK 1
 
 %macro PUSH_CALLEE 0
 push rbx
@@ -56,20 +55,11 @@ charset db '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^
 charset_end db 0
 urandom_path db '/dev/urandom',0
 cpu_rdrand db 0
-cpu_rdseed db 0
-cpu_sha_ni db 0
-%if INTEGRITY_CHECK
-integrity_msg db 'Integrity check failed!',10
-integrity_len equ $-integrity_msg
-%endif
 no_entropy_msg db 'Fatal: No reliable entropy source available!',10
 no_entropy_len equ $-no_entropy_msg
 align 16
 rot16_mask db 2,3,0,1,6,7,4,5,10,11,8,9,14,15,12,13
 rot8_mask db 3,0,1,2,7,4,5,6,11,8,9,10,15,12,13,14
-
-section .rodata align=16
-expected_hash times 64 db 0
 
 section .bss align=16
 pass resb 64
@@ -82,15 +72,10 @@ cups_seed resq 1
 cups_fill_count resd 1
 cups_take_count resd 1
 time_buf resq 2
-sha_buffer resb 128
 
 section .text
 global _start
-code_start:
 _start:
-%if INTEGRITY_CHECK
-call check_integrity
-%endif
 call check_cpu_features
 call init_entropy
 call init_cups
@@ -158,37 +143,6 @@ mov eax,SYS_EXIT
 mov edi,1
 syscall
 
-%if INTEGRITY_CHECK
-check_integrity:
-PUSH_CALLEE
-lea rdi,[code_start]
-lea rsi,[code_end]
-sub rsi,rdi
-lea rdx,[sha_buffer]
-call sha512_full
-lea rsi,[sha_buffer]
-lea rdi,[expected_hash]
-mov ecx,64
-repe cmpsb
-je .ok
-mov eax,SYS_WRITE
-mov edi,STDOUT
-lea rsi,[integrity_msg]
-mov edx,integrity_len
-syscall
-mov eax,SYS_EXIT
-mov edi,1
-syscall
-.ok:
-POP_CALLEE
-ret
-%endif
-
-sha512_full:
-; Полная программная реализация SHA-512
-; (здесь опущена для краткости, но должна быть вставлена)
-ret
-
 check_cpu_features:
 PUSH_CALLEE
 mov eax,1
@@ -197,17 +151,6 @@ test ecx,1<<30
 jz .no_rdrand
 mov byte[cpu_rdrand],1
 .no_rdrand:
-test ebx,1<<18
-jz .no_rdseed
-mov byte[cpu_rdseed],1
-.no_rdseed:
-mov eax,7
-xor ecx,ecx
-cpuid
-test ebx,1<<29
-jz .no_sha
-mov byte[cpu_sha_ni],1
-.no_sha:
 POP_CALLEE
 ret
 
@@ -346,7 +289,6 @@ POP_CALLEE
 ret
 
 get_random_position:
-; Криптостойкий генератор на ChaCha20
 PUSH_CALLEE
 mov eax,[cups_seed]
 add eax,1
@@ -456,10 +398,6 @@ mov dword[pool_pos],0
 mov dword[cups_fill_count],0
 mov dword[cups_take_count],0
 mov qword[cups_seed],0
-mov ecx,128
-lea rdi,[sha_buffer]
-rep stosb
-; Обнуление всех регистров
 xor eax,eax
 xor ebx,ebx
 xor ecx,ecx
@@ -488,4 +426,3 @@ pxor xmm14,xmm14
 pxor xmm15,xmm15
 POP_CALLEE
 ret
-code_end:
