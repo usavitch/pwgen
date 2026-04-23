@@ -1,3 +1,6 @@
+; c22.asm - генератор паролей с кубом стаканчиков и ChaCha20
+; Использует внешнюю функцию sha512_full
+
 %define SYS_READ 0
 %define SYS_WRITE 1
 %define SYS_OPEN 2
@@ -8,6 +11,8 @@
 %define O_RDONLY 0
 %define CUPS_SIDE 16
 %define CUPS_SIZE (CUPS_SIDE*CUPS_SIDE*CUPS_SIDE)
+
+extern sha512_full
 
 %macro PUSH_CALLEE 0
 push rbx
@@ -72,6 +77,7 @@ cups_seed resq 1
 cups_fill_count resd 1
 cups_take_count resd 1
 time_buf resq 2
+sha_buffer resb 64
 
 section .text
 global _start

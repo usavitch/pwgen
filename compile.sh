@@ -1,2 +1,17 @@
 #!/bin/bash
-[ $# -eq 0 ] && echo "Usage: $0 file.asm" && exit 1; nasm -f elf64 "$1" -o "${1%.*}.o" && ld -s --strip-all -z noseparate-code -z max-page-size=0x1000 "${1%.*}.o" -o "${1%.*}" && strip -s "${1%.*}" 2>/dev/null; rm -f "${1%.*}.o"; echo "Binary size: $(wc -c < "${1%.*}") bytes" || echo "Failed"
+# compile.sh - сборка генератора паролей
+
+set -e
+
+echo "=== Сборка SHA-512 модуля ==="
+nasm -f elf64 sha512.asm -o sha512.o
+
+echo "=== Сборка основного генератора ==="
+nasm -f elf64 c22.asm -o c22.o
+
+echo "=== Линковка ==="
+ld sha512.o c22.o -o c22
+
+echo "=== Готово ==="
+echo "Размер бинарного файла: $(stat -c%s c22) байт"
+echo "Запуск: ./c22"
