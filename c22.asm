@@ -1,674 +1,553 @@
 ; ================================================================
-; c22.asm - КРИПТОСТОЙКИЙ ГЕНЕРАТОР ПАРОЛЕЙ (NASM x86-64)
-; + 3D-куб 16x16x16 + 10 источников энтропии + SSE ChaCha20
-; + SHA-512 целостность + защита стека в burn_memory
-; (CET инструкции убраны для совместимости с NASM)
+; КРИПТОСТОЙКИЙ ГЕНЕРАТОР ПАРОЛЕЙ (NASM x86-64)
+; Куб 16x16 стаканчиков, каждый глубиной 16 шариков
 ; ================================================================
 
-%define SYS_READ        0
-%define SYS_WRITE       1
-%define SYS_OPEN        2
-%define SYS_CLOSE       3
+%define SYS_READ 0
+%define SYS_WRITE 1
+%define SYS_OPEN 2
+%define SYS_CLOSE 3
 %define SYS_CLOCK_GETTIME 228
-%define SYS_EXIT        60
+%define SYS_EXIT 60
+%define STDOUT 1
+%define O_RDONLY 0
+%define CUPS_X 16
+%define CUPS_Y 16
+%define CUPS_DEPTH 16
+%define CUPS_SIZE (CUPS_X * CUPS_Y * CUPS_DEPTH)
+%define BALLS_PER_CUP 16
 
-%define STDOUT          1
-%define O_RDONLY        0
-
-%define CUPS_SIDE       16
-%define CUPS_SIZE       (CUPS_SIDE * CUPS_SIDE * CUPS_SIDE)  ; 4096
-
-%define INTEGRITY_CHECK 1
-
-section .data
-    msg db 'Password: '
-    msglen equ $ - msg
-    charset db '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:,.<>?/`~"', 92
-    charset_end db 0
-    urandom_path db '/dev/urandom', 0
-
-    entropy_fail_msg db 'Fatal: No strong entropy source available', 10
-    entropy_fail_len equ $ - entropy_fail_msg
-
-    cpu_rdrand db 0
-    cpu_rdseed db 0
-    cpu_sha_ni db 0
-
-%if INTEGRITY_CHECK
-    integrity_msg db 'Integrity check failed!', 10
-    integrity_len equ $ - integrity_msg
-%endif
-
-    align 16
-    rot16_mask: db 2,3,0,1, 6,7,4,5, 10,11,8,9, 14,15,12,13
-    rot8_mask:  db 3,0,1,2, 7,4,5,6, 11,8,9,10, 15,12,13,14
-
-section .rodata align=16
-    ; Эталонный SHA-512 хеш (заменить после вычисления)
-    expected_hash: times 64 db 0
-
-; ================================================================
-; МАКРОС SSE ЧЕТВЕРТЬ-РАУНДА CHACHA20
-; ================================================================
-%macro SSE_QR 8
-    paddd %1, %2
-    pxor  %4, %1
-    pshufb %4, %5
-    paddd %3, %4
-    pxor  %2, %3
-    movdqa %7, %2
-    pslld %2, 12
-    psrld %7, 20
-    por   %2, %7
-    paddd %1, %2
-    pxor  %4, %1
-    pshufb %4, %6
-    paddd %3, %4
-    pxor  %2, %3
-    movdqa %7, %2
-    pslld %2, 7
-    psrld %7, 25
-    por   %2, %7
+%macro PUSH_CALLEE 0
+push rbx
+push rbp
+push r12
+push r13
+push r14
+push r15
 %endmacro
 
+%macro POP_CALLEE 0
+pop r15
+pop r14
+pop r13
+pop r12
+pop rbp
+pop rbx
+%endmacro
+
+%macro SSE_QR 8
+paddd %1,%2
+pxor %4,%1
+pshufb %4,%5
+paddd %3,%4
+pxor %2,%3
+movdqa %7,%2
+pslld %2,12
+psrld %7,20
+por %2,%7
+paddd %1,%2
+pxor %4,%1
+pshufb %4,%6
+paddd %3,%4
+pxor %2,%3
+movdqa %7,%2
+pslld %2,7
+psrld %7,25
+por %2,%7
+%endmacro
+
+section .data
+msg db 'Password: '
+msglen equ $-msg
+charset db '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:,.<>?/`~"',92
+charset_end db 0
+urandom_path db '/dev/urandom',0
+cpu_rdrand db 0
+err_urandom_msg db 'Fatal: Cannot read /dev/urandom',10
+err_urandom_len equ $-err_urandom_msg
+no_rdrand_msg db 'Fatal: RDRAND not supported',10
+no_rdrand_len equ $-no_rdrand_msg
+align 16
+rot16_mask db 2,3,0,1,6,7,4,5,10,11,8,9,14,15,12,13
+rot8_mask db 3,0,1,2,7,4,5,6,11,8,9,10,15,12,13,14
+
 section .bss align=16
-    pass resb 64
-    state resd 16
-    state_save resd 16
-    rand_pool resb 64
-    pool_pos resd 1
-
-    cups resd CUPS_SIZE
-    cups_seed resq 1
-    cups_fill_count resd 1
-    cups_take_count resd 1
-    time_buf resq 2
-
-    sha_buffer resb 128
+pass resb 64
+state resd 16
+state_save resd 16
+rand_pool resb 64
+pool_pos resd 1
+cups resd CUPS_SIZE
+cup_ball_count resb (CUPS_X * CUPS_Y)
+cups_fill_count resd 1
+cups_take_count resd 1
+time_buf resq 2
 
 section .text
-    global _start
-
-code_start:
-
+global _start
 _start:
-    ; Выравнивание стека (на всякий случай)
-    and rsp, ~0xF
+    call    check_cpu_features
+    call    init_entropy
+    call    init_cups
+    call    refill_pool
 
-%if INTEGRITY_CHECK
-    call check_integrity
-%endif
-
-    call check_cpu_features
-    call init_entropy
-    call init_cups
-    call refill_pool
-
-    mov r12, 24
-    mov r13, pass
+    mov     r12, 24
+    mov     r13, pass
 
 make_char:
-    push r13
+    push    r13
+    xor     r14d, r14d
 
 get_valid_byte:
-    mov eax, [pool_pos]
-    cmp eax, 64
-    jb .pool_ok
-    call refill_pool
-    xor eax, eax
+    inc     r14d
+    cmp     r14d, 65536
+    ja      fatal_exit
+
+    mov     eax, [pool_pos]
+    cmp     eax, 64
+    jb      .pool_ok
+    call    refill_pool
+    xor     eax, eax
 .pool_ok:
-    lea rbx, [rand_pool]
-    movzx eax, byte [rbx + rax]
-    inc dword [pool_pos]
-    mov r14, rax
+    lea     rbx, [rand_pool]
+    movzx   eax, byte [rbx + rax]
+    inc     dword [pool_pos]
+    mov     r15d, eax
 
-    lea rsi, [charset]
-    lea rdx, [charset_end]
-    sub rdx, rsi
-    mov r15, rdx
+    lea     rsi, [charset]
+    lea     rdx, [charset_end]
+    sub     rdx, rsi
+    mov     r8d, edx
 
-    mov eax, 256
-    xor edx, edx
-    div r15d
-    mov eax, 256
-    sub eax, edx
-    mov ebx, eax
+    mov     eax, 256
+    xor     edx, edx
+    div     r8d
+    mov     eax, 256
+    sub     eax, edx
+    mov     ebx, eax
 
-    cmp r14, rbx
-    jae get_valid_byte
+    cmp     r15d, ebx
+    jae     get_valid_byte
 
-    mov eax, r14d
-    xor edx, edx
-    div r15d
-    mov eax, edx
+    mov     eax, r15d
+    xor     edx, edx
+    div     r8d
+    mov     eax, edx
 
-    pop r13
-    lea rsi, [charset]
-    mov al, [rsi + rax]
-    mov [r13], al
-    inc r13
+    pop     r13
+    lea     rsi, [charset]
+    mov     al, [rsi + rax]
+    mov     [r13], al
+    inc     r13
 
-    dec r12
-    jnz make_char
+    dec     r12
+    jnz     make_char
 
-    mov byte [r13], 10
+    mov     byte [r13], 10
 
-    mov eax, SYS_WRITE
-    mov edi, STDOUT
-    mov rsi, msg
-    mov rdx, msglen
+    mov     eax, SYS_WRITE
+    mov     edi, STDOUT
+    mov     rsi, msg
+    mov     rdx, msglen
     syscall
 
-    mov eax, SYS_WRITE
-    mov edi, STDOUT
-    mov rsi, pass
-    mov rdx, 25
+    mov     eax, SYS_WRITE
+    mov     edi, STDOUT
+    mov     rsi, pass
+    mov     rdx, 25
     syscall
 
-    call burn_memory
+    call    burn_memory
 
-    mov eax, SYS_EXIT
-    xor edi, edi
+    mov     eax, SYS_EXIT
+    xor     edi, edi
     syscall
 
-; ================================================================
-; ПРОВЕРКА ЦЕЛОСТНОСТИ (SHA-512)
-; ================================================================
-%if INTEGRITY_CHECK
-check_integrity:
-    push rsi
-    push rcx
-    push rax
-    push rbx
-    push rdx
-    push rdi
-
-    lea rdi, [code_start]
-    lea rsi, [code_end]
-    sub rsi, rdi
-    lea rdx, [sha_buffer]
-    call sha512
-
-    lea rsi, [sha_buffer]
-    lea rdi, [expected_hash]
-    mov ecx, 64
-    repe cmpsb
-    je .ok
-
-    mov eax, SYS_WRITE
-    mov edi, STDOUT
-    lea rsi, [integrity_msg]
-    mov edx, integrity_len
+fatal_exit:
+    mov     eax, SYS_EXIT
+    mov     edi, 1
     syscall
 
-    mov eax, SYS_EXIT
-    mov edi, 1
-    syscall
-
-.ok:
-    pop rdi
-    pop rdx
-    pop rbx
-    pop rax
-    pop rcx
-    pop rsi
-    ret
-%endif
-
-; ================================================================
-; SHA-512 (заглушка)
-; ================================================================
-sha512:
-    push rcx
-    push rdi
-    mov rcx, 64
-    mov rdi, rdx
-    xor eax, eax
-    rep stosb
-    pop rdi
-    pop rcx
-    ret
-
-; ================================================================
-; Проверка CPUID
-; ================================================================
 check_cpu_features:
-    push rbx
-    push rcx
-    push rdx
-
-    mov eax, 1
+    PUSH_CALLEE
+    mov     eax, 1
     cpuid
-    test ecx, 1 << 30
-    jz .no_rdrand
-    mov byte [cpu_rdrand], 1
+    test    ecx, 1<<30
+    jz      .no_rdrand
+    mov     byte [cpu_rdrand], 1
 .no_rdrand:
-    test ebx, 1 << 18
-    jz .no_rdseed
-    mov byte [cpu_rdseed], 1
-.no_rdseed:
-    mov eax, 7
-    xor ecx, ecx
-    cpuid
-    test ebx, 1 << 29
-    jz .no_sha
-    mov byte [cpu_sha_ni], 1
-.no_sha:
-
-    pop rdx
-    pop rcx
-    pop rbx
+    POP_CALLEE
     ret
 
-; ================================================================
-; Инициализация энтропии (urandom или RDRAND, иначе abort)
-; ================================================================
 init_entropy:
-    mov eax, SYS_OPEN
-    lea rdi, [urandom_path]
-    xor esi, esi
+    PUSH_CALLEE
+    mov     eax, SYS_OPEN
+    lea     rdi, [urandom_path]
+    xor     esi, esi
     syscall
-    test eax, eax
-    js .try_hw
+    test    eax, eax
+    js      .fallback_to_rdrand
 
-    mov edi, eax
-    xor eax, eax
-    lea rsi, [state]
-    mov edx, 64
+    mov     edi, eax
+    xor     eax, eax
+    lea     rsi, [state]
+    mov     edx, 64
     syscall
-    push rax
-    mov eax, SYS_CLOSE
-    syscall
-    pop rax
-    cmp rax, 64
-    je .done
+    cmp     rax, 64
+    jne     .urandom_failed
 
-.try_hw:
-    cmp byte [cpu_rdrand], 1
-    jne .fail
-    mov ecx, 16
-    xor ebx, ebx
-.hw_loop:
-    rdrand eax
-    jnc .hw_loop
-    mov [state + rbx*4], eax
-    inc ebx
-    loop .hw_loop
-    jmp .done
+    mov     eax, SYS_CLOSE
+    syscall
+    jmp     .done
 
-.fail:
-    mov eax, SYS_WRITE
-    mov edi, STDOUT
-    lea rsi, [entropy_fail_msg]
-    mov edx, entropy_fail_len
+.urandom_failed:
+    mov     eax, SYS_WRITE
+    mov     edi, STDOUT
+    lea     rsi, [err_urandom_msg]
+    mov     edx, err_urandom_len
     syscall
-    mov eax, SYS_EXIT
-    mov edi, 1
+    jmp     fatal_exit
+
+.fallback_to_rdrand:
+    cmp     byte [cpu_rdrand], 1
+    jne     .no_rdrand
+    mov     ecx, 16
+    xor     ebx, ebx
+.rdrand_loop:
+    call    get_hw_random
+    mov     [state + rbx*4], eax
+    inc     ebx
+    loop    .rdrand_loop
+    jmp     .done
+
+.no_rdrand:
+    mov     eax, SYS_WRITE
+    mov     edi, STDOUT
+    lea     rsi, [no_rdrand_msg]
+    mov     edx, no_rdrand_len
     syscall
+    jmp     fatal_exit
 
 .done:
+    POP_CALLEE
     ret
 
-; ================================================================
-; Аппаратный случайный байт
-; ================================================================
 get_hw_random:
-    cmp byte [cpu_rdrand], 1
-    jne .no_rdrand
-    rdrand eax
-    jnc .no_rdrand
+    push    rcx
+    mov     ecx, 10
+.retry:
+    cmp     byte [cpu_rdrand], 1
+    jne     .fail
+    rdrand  eax
+    jnc     .next_attempt
+    pop     rcx
     ret
-.no_rdrand:
-    rdtsc
+.next_attempt:
+    dec     ecx
+    jnz     .retry
+.fail:
+    pop     rcx
+    xor     eax, eax
+    ret
+
+get_random_byte:
+    push    rcx
+    call    get_hw_random
+    and     eax, 0xFF
+    pop     rcx
     ret
 
 ; ================================================================
-; Инициализация куба
+; ИНИЦИАЛИЗАЦИЯ КУБА
 ; ================================================================
 init_cups:
-    rdtsc
-    shl rax, 32
-    or rax, rdx
-    bts rax, 0
-    mov [cups_seed], rax
+    PUSH_CALLEE
+    
+    ; Обнуляем куб
+    mov     ecx, CUPS_SIZE
+    lea     rdi, [cups]
+    xor     eax, eax
+    rep stosd
+    
+    ; Обнуляем счётчики
+    mov     ecx, CUPS_X * CUPS_Y
+    lea     rdi, [cup_ball_count]
+    rep stosb
+    
+    ; Заполняем стаканчики
+    mov     r12d, CUPS_X * CUPS_Y
+    xor     r13d, r13d
+    
+.init_cup_loop:
+    call    get_random_byte
+    and     eax, 0x0F
+    cmp     eax, 4
+    jb      .min_balls
+    cmp     eax, 12
+    jbe     .balls_ok
+.min_balls:
+    mov     eax, 8
+.balls_ok:
+    mov     r14d, eax
+    mov     [cup_ball_count + r13], al
+    
+    xor     ebx, ebx
+.fill_balls:
+    cmp     ebx, r14d
+    jae     .next_cup
+    
+    mov     eax, r13d
+    shl     eax, 4
+    add     eax, ebx
+    mov     edi, eax
+    
+    call    collect_single_entropy
+    mov     [cups + rdi*4], ebx
+    
+    inc     ebx
+    jmp     .fill_balls
+    
+.next_cup:
+    inc     r13d
+    dec     r12d
+    jnz     .init_cup_loop
 
-    mov ecx, CUPS_SIZE
-    xor ebx, ebx
-.zero_loop:
-    mov [cups + rbx*4], ebx
-    inc ebx
-    loop .zero_loop
-
-    mov r12d, CUPS_SIZE / 4
-.init_loop:
-    call get_random_position
-    mov r13, rax
-    call collect_single_entropy
-    mov [cups + r13*4], ebx
-    dec r12d
-    jnz .init_loop
-
-    mov dword [cups_fill_count], CUPS_SIZE / 4
-    mov dword [cups_take_count], 0
+    mov     dword [cups_fill_count], 0
+    mov     dword [cups_take_count], 0
+    POP_CALLEE
     ret
 
 ; ================================================================
-; Сбор и разбрасывание
+; РАЗБРАСЫВАНИЕ ШАРИКОВ
 ; ================================================================
 collect_and_splash:
-    push r12
-    push r13
-    mov r12d, 10
+    PUSH_CALLEE
+    mov     r12d, 10
+    
 .splash_loop:
-    call get_random_position
-    mov r13, rax
-    call collect_single_entropy
-    xor [cups + r13*4], ebx
-    mov eax, [cups_fill_count]
-    cmp eax, CUPS_SIZE
-    jae .skip_fill
-    inc dword [cups_fill_count]
-.skip_fill:
-    dec r12d
-    jnz .splash_loop
-    pop r13
-    pop r12
+    call    get_random_position
+    mov     r13d, eax
+    
+    call    collect_single_entropy
+    mov     r14d, ebx
+    
+    movzx   eax, byte [cup_ball_count + r13]
+    cmp     eax, BALLS_PER_CUP
+    jb      .add_ball
+    
+    call    get_random_byte
+    and     eax, 0x0F
+    jmp     .write_ball
+    
+.add_ball:
+    inc     byte [cup_ball_count + r13]
+.write_ball:
+    mov     edx, r13d
+    shl     edx, 4
+    add     edx, eax
+    mov     [cups + rdx*4], r14d
+    
+    mov     eax, [cups_fill_count]
+    cmp     eax, CUPS_SIZE
+    jae     .skip_count
+    inc     dword [cups_fill_count]
+.skip_count:
+    dec     r12d
+    jnz     .splash_loop
+    
+    POP_CALLEE
     ret
 
 ; ================================================================
-; Извлечение из куба
+; ИЗВЛЕЧЕНИЕ ШАРИКОВ
 ; ================================================================
 sip_from_cups:
-    push r12
-    push r13
-    push r14
-    mov r12d, 8
-    xor r13d, r13d
+    PUSH_CALLEE
+    mov     r12d, 8
+    xor     r13d, r13d
+    
 .sip_loop:
-    call get_random_position
-    mov r14, rax
-    mov ebx, [cups + r14*4]
-    xor [state + r13*4], ebx
-    inc dword [cups_take_count]
-    mov eax, [cups_take_count]
-    and eax, 0x0F
-    jnz .skip_clean
-    call get_random_position
-    mov r14, rax
-    call collect_single_entropy
-    mov [cups + r14*4], ebx
-.skip_clean:
-    inc r13d
-    cmp r13d, 16
-    jl .next_sip
-    xor r13d, r13d
+    call    get_random_position
+    mov     r14d, eax
+    
+    movzx   eax, byte [cup_ball_count + r14]
+    test    eax, eax
+    jz      .next_sip
+    
+    push    rax
+    call    get_random_byte
+    pop     rcx
+    xor     edx, edx
+    div     ecx
+    mov     eax, edx
+    
+    mov     edx, r14d
+    shl     edx, 4
+    add     edx, eax
+    
+    mov     ebx, [cups + rdx*4]
+    xor     [state + r13*4], ebx
+    
+    inc     dword [cups_take_count]
+    
+    mov     eax, [cups_take_count]
+    and     eax, 0x07
+    jnz     .skip_update
+    
+    call    collect_single_entropy
+    mov     [cups + rdx*4], ebx
+    
+.skip_update:
+    inc     r13d
+    cmp     r13d, 16
+    jl      .next_sip
+    xor     r13d, r13d
+    
 .next_sip:
-    dec r12d
-    jnz .sip_loop
-    pop r14
-    pop r13
-    pop r12
+    dec     r12d
+    jnz     .sip_loop
+    
+    POP_CALLEE
     ret
 
 ; ================================================================
-; XorShift64
+; СЛУЧАЙНАЯ ПОЗИЦИЯ СТАКАНЧИКА
 ; ================================================================
 get_random_position:
-    push rdx
-    push rcx
-    mov rax, [cups_seed]
-    test rax, rax
-    jnz .seed_ok
-    rdtsc
-    shl rax, 32
-    or rax, rdx
-    or rax, 1
-    mov [cups_seed], rax
-.seed_ok:
-    mov rax, [cups_seed]
-    mov rdx, rax
-    shl rax, 13
-    xor rdx, rax
-    mov rax, rdx
-    shr rax, 7
-    xor rdx, rax
-    mov rax, rdx
-    shl rax, 17
-    xor rdx, rax
-    mov [cups_seed], rdx
-    xor edx, edx
-    mov eax, [cups_seed]
-    mov ecx, CUPS_SIZE
-    div ecx
-    mov eax, edx
-    cmp eax, CUPS_SIZE
-    jb .pos_ok
-    xor eax, eax
-.pos_ok:
-    pop rcx
-    pop rdx
+    PUSH_CALLEE
+    call    chacha20_block_sse
+    mov     eax, [state]
+    xor     edx, edx
+    mov     ecx, CUPS_X * CUPS_Y
+    div     ecx
+    mov     eax, edx
+    POP_CALLEE
     ret
 
-; ================================================================
-; Сбор одного источника (10 источников)
-; ================================================================
 collect_single_entropy:
-    push rax
-    push rcx
-    push rdx
-    call get_hw_random
-    mov ebx, eax
+    push    rax
+    push    rcx
+    push    rdx
+    call    get_hw_random
+    mov     ebx, eax
     rdtscp
-    xor ebx, eax
-    xor ebx, ecx
-    mov eax, SYS_CLOCK_GETTIME
-    mov edi, 1
-    lea rsi, [time_buf]
+    xor     ebx, eax
+    xor     ebx, ecx
+    mov     eax, SYS_CLOCK_GETTIME
+    mov     edi, 1
+    lea     rsi, [time_buf]
     syscall
-    mov eax, [time_buf + 8]
-    xor ebx, eax
-    mov rax, rsp
-    xor ebx, eax
-    lea rax, [rel _start]
-    xor ebx, eax
-    mov eax, 39
-    syscall
-    xor ebx, eax
-    mov eax, 186
-    syscall
-    xor ebx, eax
+    mov     eax, [time_buf+8]
+    xor     ebx, eax
     pushfq
-    pop rax
-    xor ebx, eax
-    pop rdx
-    pop rcx
-    pop rax
+    pop     rax
+    xor     ebx, eax
+    pop     rdx
+    pop     rcx
+    pop     rax
     ret
 
-; ================================================================
-; Заполнение пула
-; ================================================================
 refill_pool:
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r12
-    push r13
+    PUSH_CALLEE
+    call    collect_and_splash
+    call    sip_from_cups
 
-    call collect_and_splash
-    call sip_from_cups
-
-    mov ecx, 16
-    xor ebx, ebx
+    mov     ecx, 16
+    xor     ebx, ebx
 .save:
-    mov eax, [state + rbx*4]
-    mov [state_save + rbx*4], eax
-    inc ebx
-    loop .save
+    mov     eax, [state + rbx*4]
+    mov     [state_save + rbx*4], eax
+    inc     ebx
+    loop    .save
 
-    call chacha20_block_sse
+    call    chacha20_block_sse
 
-    mov ecx, 16
-    xor ebx, ebx
+    mov     ecx, 16
+    xor     ebx, ebx
 .final:
-    mov eax, [state_save + rbx*4]
-    add [state + rbx*4], eax
-    inc ebx
-    loop .final
+    mov     eax, [state_save + rbx*4]
+    add     [state + rbx*4], eax
+    inc     ebx
+    loop    .final
 
-    mov ecx, 16
-    xor ebx, ebx
+    mov     ecx, 16
+    xor     ebx, ebx
 .copy:
-    mov eax, [state + rbx*4]
-    mov [rand_pool + rbx*4], eax
-    inc ebx
-    loop .copy
+    mov     eax, [state + rbx*4]
+    mov     [rand_pool + rbx*4], eax
+    inc     ebx
+    loop    .copy
 
-    mov dword [pool_pos], 0
-
-    pop r13
-    pop r12
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
+    mov     dword [pool_pos], 0
+    POP_CALLEE
     ret
 
-; ================================================================
-; CHACHA20 SSE
-; ================================================================
 chacha20_block_sse:
-    push rbx
-    push rcx
-    movdqa xmm0, [rot16_mask]
-    movdqa xmm1, [rot8_mask]
-    movdqa xmm8,  [state]
-    movdqa xmm9,  [state+16]
-    movdqa xmm10, [state+32]
-    movdqa xmm11, [state+48]
-    mov ecx, 10
+    PUSH_CALLEE
+    movdqa  xmm0, [rot16_mask]
+    movdqa  xmm1, [rot8_mask]
+    movdqa  xmm8,  [state]
+    movdqa  xmm9,  [state+16]
+    movdqa  xmm10, [state+32]
+    movdqa  xmm11, [state+48]
+    mov     ecx, 10
 .round_loop:
-    SSE_QR xmm8, xmm9, xmm10, xmm11, xmm0, xmm1, xmm2, xmm3
-    movdqa xmm2, xmm8
-    movdqa xmm3, xmm9
-    movdqa xmm4, xmm10
-    movdqa xmm5, xmm11
-    pshufd xmm8, xmm2, 0x00
-    pshufd xmm9, xmm3, 0x55
-    pshufd xmm10, xmm4, 0xAA
-    pshufd xmm11, xmm5, 0xFF
-    punpckldq xmm8, xmm9
-    punpckldq xmm10, xmm11
-    punpcklqdq xmm8, xmm10
-    pshufd xmm9, xmm2, 0x55
-    pshufd xmm10, xmm3, 0xAA
-    pshufd xmm11, xmm4, 0xFF
-    pshufd xmm12, xmm5, 0x00
-    punpckldq xmm9, xmm10
-    punpckldq xmm11, xmm12
-    punpcklqdq xmm9, xmm11
-    pshufd xmm10, xmm2, 0xAA
-    pshufd xmm11, xmm3, 0xFF
-    pshufd xmm12, xmm4, 0x00
-    pshufd xmm13, xmm5, 0x55
-    punpckldq xmm10, xmm11
-    punpckldq xmm12, xmm13
-    punpcklqdq xmm10, xmm12
-    pshufd xmm11, xmm2, 0xFF
-    pshufd xmm12, xmm3, 0x00
-    pshufd xmm13, xmm4, 0x55
-    pshufd xmm14, xmm5, 0xAA
-    punpckldq xmm11, xmm12
-    punpckldq xmm13, xmm14
-    punpcklqdq xmm11, xmm13
-    SSE_QR xmm8, xmm9, xmm10, xmm11, xmm0, xmm1, xmm2, xmm3
-    movdqa xmm2, xmm8
-    movdqa xmm3, xmm9
-    movdqa xmm4, xmm10
-    movdqa xmm5, xmm11
-    pshufd xmm8, xmm2, 0x00
-    pshufd xmm9, xmm5, 0x55
-    pshufd xmm10, xmm4, 0xAA
-    pshufd xmm11, xmm3, 0xFF
-    punpckldq xmm8, xmm9
-    punpckldq xmm10, xmm11
-    punpcklqdq xmm8, xmm10
-    pshufd xmm9, xmm3, 0x00
-    pshufd xmm10, xmm2, 0x55
-    pshufd xmm11, xmm5, 0xAA
-    pshufd xmm12, xmm4, 0xFF
-    punpckldq xmm9, xmm10
-    punpckldq xmm11, xmm12
-    punpcklqdq xmm9, xmm11
-    pshufd xmm10, xmm4, 0x00
-    pshufd xmm11, xmm3, 0x55
-    pshufd xmm12, xmm2, 0xAA
-    pshufd xmm13, xmm5, 0xFF
-    punpckldq xmm10, xmm11
-    punpckldq xmm12, xmm13
-    punpcklqdq xmm10, xmm12
-    pshufd xmm11, xmm5, 0x00
-    pshufd xmm12, xmm4, 0x55
-    pshufd xmm13, xmm3, 0xAA
-    pshufd xmm14, xmm2, 0xFF
-    punpckldq xmm11, xmm12
-    punpckldq xmm13, xmm14
-    punpcklqdq xmm11, xmm13
-    dec ecx
-    jnz .round_loop
-    movdqa [state], xmm8
-    movdqa [state+16], xmm9
-    movdqa [state+32], xmm10
-    movdqa [state+48], xmm11
-    pop rcx
-    pop rbx
+    SSE_QR  xmm8, xmm9, xmm10, xmm11, xmm0, xmm1, xmm2, xmm3
+    SSE_QR  xmm8, xmm9, xmm10, xmm11, xmm0, xmm1, xmm2, xmm3
+    dec     ecx
+    jnz     .round_loop
+    movdqa  [state], xmm8
+    movdqa  [state+16], xmm9
+    movdqa  [state+32], xmm10
+    movdqa  [state+48], xmm11
+    POP_CALLEE
     ret
 
-; ================================================================
-; Очистка памяти БЕЗ порчи стека
-; ================================================================
 burn_memory:
-    xor eax, eax
-    mov ecx, 16
-    xor ebx, ebx
-.burn_loop:
-    mov [state + rbx*4], eax
-    mov [state_save + rbx*4], eax
-    mov [rand_pool + rbx*4], eax
-    inc ebx
-    loop .burn_loop
-
-    mov ecx, CUPS_SIZE
-    xor ebx, ebx
-.burn_cups:
-    mov [cups + rbx*4], eax
-    inc ebx
-    loop .burn_cups
-
-    mov ecx, 64
-    lea rdi, [pass]
+    PUSH_CALLEE
+    mov     ecx, 16
+    xor     eax, eax
+    lea     rdi, [state]
+    rep stosd
+    lea     rdi, [state_save]
+    mov     ecx, 16
+    rep stosd
+    lea     rdi, [rand_pool]
+    mov     ecx, 16
+    rep stosd
+    mov     ecx, CUPS_SIZE
+    lea     rdi, [cups]
+    rep stosd
+    mov     ecx, CUPS_X * CUPS_Y
+    lea     rdi, [cup_ball_count]
     rep stosb
-
-    mov dword [pool_pos], 0
-    mov dword [cups_fill_count], 0
-    mov dword [cups_take_count], 0
-    mov qword [cups_seed], 0
+    mov     ecx, 64
+    lea     rdi, [pass]
+    rep stosb
+    mov     dword [pool_pos], 0
+    mov     dword [cups_fill_count], 0
+    mov     dword [cups_take_count], 0
+    xor     eax, eax
+    xor     ebx, ebx
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     esi, esi
+    xor     edi, edi
+    xor     r8, r8
+    xor     r9, r9
+    xor     r10, r10
+    xor     r11, r11
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
+    pxor    xmm6, xmm6
+    pxor    xmm7, xmm7
+    pxor    xmm8, xmm8
+    pxor    xmm9, xmm9
+    pxor    xmm10, xmm10
+    pxor    xmm11, xmm11
+    POP_CALLEE
     ret
-
-code_end:
-
-; ================================================================
-; Intel CET property (необязательно)
-; ================================================================
-section .note.gnu.property align=8
-    dd 4
-    dd 16
-    dd 5
-    db "GNU", 0
-    dd 0xc0000002
-    dd 4
-    dd 3
-    dd 0
