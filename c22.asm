@@ -523,61 +523,50 @@ chacha20_block_sse:
 ; ======================================================================
 ; ОЧИСТКА ПАМЯТИ (ФИНАЛЬНАЯ ВЕРСИЯ — БЕЗОПАСНАЯ ОЧИСТКА СТЕКА)
 ; ======================================================================
+; ======================================================================
+; ОЧИСТКА ПАМЯТИ (ПЕРЕПИСАННАЯ ВЕРСИЯ)
+; ======================================================================
 burn_memory:
     PUSH_CALLEE
-
-    ; 1. Очищаем все буферы в .bss
-    mov     ecx, 16
+    
+    ; 1. Зачистка всех статических буферов
     xor     eax, eax
+    
+    ; state + state_save + rand_pool = 16+16+16 = 48 dwords
     lea     rdi, [state]
+    mov     ecx, 48
     rep stosd
-    lea     rdi, [state_save]
-    mov     ecx, 16
-    rep stosd
-    lea     rdi, [rand_pool]
-    mov     ecx, 16
-    rep stosd
-    mov     ecx, CUPS_SIZE
+    
+    ; cups - 4096 dwords
     lea     rdi, [cups]
+    mov     ecx, CUPS_SIZE
     rep stosd
-    mov     ecx, CUPS_X * CUPS_Y
+    
+    ; cup_ball_count - 256 bytes
     lea     rdi, [cup_ball_count]
+    mov     ecx, CUPS_X * CUPS_Y
     rep stosb
-    mov     ecx, 64
+    
+    ; pass - 64 bytes
     lea     rdi, [pass]
+    mov     ecx, 64
     rep stosb
-
-    ; 2. Обнуляем счётчики в памяти
+    
+    ; Обнуляем счётчики
     mov     dword [pool_pos], 0
     mov     dword [cups_fill_count], 0
     mov     dword [cups_take_count], 0
-
-    ; 3. Корректно очищаем стек (область ЛОКАЛЬНЫХ данных)
-    ;    Очищаем 256 байт НИЖЕ текущего RSP (область, которую использовали мы)
-    lea     rdi, [rsp - 256]   ; начало очищаемой области
-    mov     ecx, 256 / 8       ; 32 qword'а
+    
+    ; 2. Зачистка стека (безопасный метод)
+    ; Затираем 512 байт ВЫШЕ текущего RSP
+    mov     rdi, rsp
+    mov     rcx, 64
     xor     eax, eax
-    cld                        ; идём вперёд (от меньших адресов к большим)
-    rep stosq
-
-    ; 4. Очищаем ВСЕ регистры общего назначения
-    xor     rax, rax
-    xor     rbx, rbx
-    xor     rcx, rcx
-    xor     rdx, rdx
-    xor     rsi, rsi
-    xor     rdi, rdi
-    xor     rbp, rbp
-    xor     r8,  r8
-    xor     r9,  r9
-    xor     r10, r10
-    xor     r11, r11
-    xor     r12, r12
-    xor     r13, r13
-    xor     r14, r14
-    xor     r15, r15
-
-    ; 5. Очищаем ВСЕ XMM регистры
+.stack_loop:
+    mov     [rdi + rcx*8], rax
+    loop    .stack_loop
+    
+    ; 3. Зачистка XMM регистров
     pxor    xmm0,  xmm0
     pxor    xmm1,  xmm1
     pxor    xmm2,  xmm2
@@ -594,6 +583,21 @@ burn_memory:
     pxor    xmm13, xmm13
     pxor    xmm14, xmm14
     pxor    xmm15, xmm15
-
+    
+    ; 4. Финальное обнуление рабочих регистров
+    xor     rbx, rbx
+    xor     rcx, rcx
+    xor     rdx, rdx
+    xor     rsi, rsi
+    xor     rdi, rdi
+    xor     r8,  r8
+    xor     r9,  r9
+    xor     r10, r10
+    xor     r11, r11
+    xor     r12, r12
+    xor     r13, r13
+    xor     r14, r14
+    xor     r15, r15
+    
     POP_CALLEE
     ret
