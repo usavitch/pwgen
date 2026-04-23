@@ -1,6 +1,6 @@
 ; ======================================================================
 ; КРИПТОСТОЙКИЙ ГЕНЕРАТОР ПАРОЛЕЙ (NASM x86-64)
-; Исправлено: burn_memory очищает регистры, убран rdtsc, защита от DOS
+; Финальная версия: безопасный стек, проверка read, очистка всего
 ; ======================================================================
 
 %define SYS_READ 0
@@ -17,6 +17,7 @@
 %define CUPS_SIZE (CUPS_X * CUPS_Y * CUPS_DEPTH)
 %define BALLS_PER_CUP 16
 %define MAX_RETRIES 65536
+%define STACK_CLEAN_SIZE 256
 
 %macro PUSH_CALLEE 0
 push rbx
@@ -70,6 +71,8 @@ no_rdrand_msg db 'Fatal: RDRAND not supported',10
 no_rdrand_len equ $-no_rdrand_msg
 dos_msg db 'Fatal: Too many retries in get_valid_byte',10
 dos_len equ $-dos_msg
+read_err_msg db 'Fatal: Short read from /dev/urandom',10
+read_err_len equ $-read_err_msg
 align 16
 rot16_mask db 2,3,0,1,6,7,4,5,10,11,8,9,14,15,12,13
 rot8_mask db 3,0,1,2,7,4,5,6,11,8,9,10,15,12,13,14
@@ -178,6 +181,14 @@ dos_exit:
     syscall
     jmp     fatal_exit
 
+read_error_exit:
+    mov     eax, SYS_WRITE
+    mov     edi, STDOUT
+    lea     rsi, [read_err_msg]
+    mov     edx, read_err_len
+    syscall
+    jmp     fatal_exit
+
 fatal_exit:
     mov     eax, SYS_EXIT
     mov     edi, 1
@@ -209,7 +220,7 @@ init_entropy:
     mov     edx, 64
     syscall
     cmp     rax, 64
-    jne     .urandom_failed
+    jb      read_error_exit
 
     mov     eax, SYS_CLOSE
     syscall
@@ -272,9 +283,6 @@ get_random_byte:
     pop     rcx
     ret
 
-; ======================================================================
-; ИНИЦИАЛИЗАЦИЯ КУБА (без rdtsc)
-; ======================================================================
 init_cups:
     PUSH_CALLEE
     
@@ -329,9 +337,6 @@ init_cups:
     POP_CALLEE
     ret
 
-; ======================================================================
-; РАЗБРАСЫВАНИЕ ШАРИКОВ
-; ======================================================================
 collect_and_splash:
     PUSH_CALLEE
     mov     r12d, 10
@@ -370,9 +375,6 @@ collect_and_splash:
     POP_CALLEE
     ret
 
-; ======================================================================
-; ИЗВЛЕЧЕНИЕ ШАРИКОВ
-; ======================================================================
 sip_from_cups:
     PUSH_CALLEE
     mov     r12d, 8
@@ -422,9 +424,6 @@ sip_from_cups:
     POP_CALLEE
     ret
 
-; ======================================================================
-; СЛУЧАЙНАЯ ПОЗИЦИЯ СТАКАНЧИКА (через ChaCha20, без rdtsc)
-; ======================================================================
 get_random_position:
     PUSH_CALLEE
     call    chacha20_block_sse
@@ -516,12 +515,15 @@ chacha20_block_sse:
     ret
 
 ; ======================================================================
-; ОЧИСТКА ПАМЯТИ (теперь очищает и регистры)
+; ОЧИСТКА ПАМЯТИ (исправленная версия с безопасной очисткой стека)
+; ======================================================================
+; ======================================================================
+; ОЧИСТКА ПАМЯТИ (исправленная версия с безопасной очисткой стека)
 ; ======================================================================
 burn_memory:
     PUSH_CALLEE
     
-    ; Очищаем память
+    ; Очищаем все буферы в .bss
     mov     ecx, 16
     xor     eax, eax
     lea     rdi, [state]
@@ -542,10 +544,20 @@ burn_memory:
     lea     rdi, [pass]
     rep stosb
     
-    ; Обнуляем счётчики
+    ; Обнуляем счётчики в памяти
     mov     dword [pool_pos], 0
     mov     dword [cups_fill_count], 0
     mov     dword [cups_take_count], 0
+    
+    ; Безопасно очищаем стек без изменения RSP
+    ; Используем прямой индекс от RSP
+    mov     ecx, STACK_CLEAN_SIZE / 8
+    lea     rdi, [rsp - STACK_CLEAN_SIZE]
+    xor     eax, eax
+.clean_stack:
+    mov     [rdi], rax
+    add     rdi, 8
+    loop    .clean_stack
     
     ; Очищаем ВСЕ регистры общего назначения
     xor     rax, rax
