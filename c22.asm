@@ -1,7 +1,7 @@
-; ================================================================
+; ======================================================================
 ; КРИПТОСТОЙКИЙ ГЕНЕРАТОР ПАРОЛЕЙ (NASM x86-64)
-; Куб 16x16 стаканчиков, каждый глубиной 16 шариков
-; ================================================================
+; Исправлено: burn_memory очищает регистры, убран rdtsc, защита от DOS
+; ======================================================================
 
 %define SYS_READ 0
 %define SYS_WRITE 1
@@ -16,6 +16,7 @@
 %define CUPS_DEPTH 16
 %define CUPS_SIZE (CUPS_X * CUPS_Y * CUPS_DEPTH)
 %define BALLS_PER_CUP 16
+%define MAX_RETRIES 65536
 
 %macro PUSH_CALLEE 0
 push rbx
@@ -67,6 +68,8 @@ err_urandom_msg db 'Fatal: Cannot read /dev/urandom',10
 err_urandom_len equ $-err_urandom_msg
 no_rdrand_msg db 'Fatal: RDRAND not supported',10
 no_rdrand_len equ $-no_rdrand_msg
+dos_msg db 'Fatal: Too many retries in get_valid_byte',10
+dos_len equ $-dos_msg
 align 16
 rot16_mask db 2,3,0,1,6,7,4,5,10,11,8,9,14,15,12,13
 rot8_mask db 3,0,1,2,7,4,5,6,11,8,9,10,15,12,13,14
@@ -91,7 +94,7 @@ _start:
     call    init_cups
     call    refill_pool
 
-    mov     r12, 24
+    mov     r12d, 24
     mov     r13, pass
 
 make_char:
@@ -100,8 +103,8 @@ make_char:
 
 get_valid_byte:
     inc     r14d
-    cmp     r14d, 65536
-    ja      fatal_exit
+    cmp     r14d, MAX_RETRIES
+    ja      dos_exit
 
     mov     eax, [pool_pos]
     cmp     eax, 64
@@ -140,7 +143,7 @@ get_valid_byte:
     mov     [r13], al
     inc     r13
 
-    dec     r12
+    dec     r12d
     jnz     make_char
 
     mov     byte [r13], 10
@@ -150,18 +153,30 @@ get_valid_byte:
     mov     rsi, msg
     mov     rdx, msglen
     syscall
+    test    rax, rax
+    js      fatal_exit
 
     mov     eax, SYS_WRITE
     mov     edi, STDOUT
     mov     rsi, pass
     mov     rdx, 25
     syscall
+    test    rax, rax
+    js      fatal_exit
 
     call    burn_memory
 
     mov     eax, SYS_EXIT
     xor     edi, edi
     syscall
+
+dos_exit:
+    mov     eax, SYS_WRITE
+    mov     edi, STDOUT
+    lea     rsi, [dos_msg]
+    mov     edx, dos_len
+    syscall
+    jmp     fatal_exit
 
 fatal_exit:
     mov     eax, SYS_EXIT
@@ -257,24 +272,21 @@ get_random_byte:
     pop     rcx
     ret
 
-; ================================================================
-; ИНИЦИАЛИЗАЦИЯ КУБА
-; ================================================================
+; ======================================================================
+; ИНИЦИАЛИЗАЦИЯ КУБА (без rdtsc)
+; ======================================================================
 init_cups:
     PUSH_CALLEE
     
-    ; Обнуляем куб
     mov     ecx, CUPS_SIZE
     lea     rdi, [cups]
     xor     eax, eax
     rep stosd
     
-    ; Обнуляем счётчики
     mov     ecx, CUPS_X * CUPS_Y
     lea     rdi, [cup_ball_count]
     rep stosb
     
-    ; Заполняем стаканчики
     mov     r12d, CUPS_X * CUPS_Y
     xor     r13d, r13d
     
@@ -317,9 +329,9 @@ init_cups:
     POP_CALLEE
     ret
 
-; ================================================================
+; ======================================================================
 ; РАЗБРАСЫВАНИЕ ШАРИКОВ
-; ================================================================
+; ======================================================================
 collect_and_splash:
     PUSH_CALLEE
     mov     r12d, 10
@@ -358,9 +370,9 @@ collect_and_splash:
     POP_CALLEE
     ret
 
-; ================================================================
+; ======================================================================
 ; ИЗВЛЕЧЕНИЕ ШАРИКОВ
-; ================================================================
+; ======================================================================
 sip_from_cups:
     PUSH_CALLEE
     mov     r12d, 8
@@ -410,9 +422,9 @@ sip_from_cups:
     POP_CALLEE
     ret
 
-; ================================================================
-; СЛУЧАЙНАЯ ПОЗИЦИЯ СТАКАНЧИКА
-; ================================================================
+; ======================================================================
+; СЛУЧАЙНАЯ ПОЗИЦИЯ СТАКАНЧИКА (через ChaCha20, без rdtsc)
+; ======================================================================
 get_random_position:
     PUSH_CALLEE
     call    chacha20_block_sse
@@ -503,8 +515,13 @@ chacha20_block_sse:
     POP_CALLEE
     ret
 
+; ======================================================================
+; ОЧИСТКА ПАМЯТИ (теперь очищает и регистры)
+; ======================================================================
 burn_memory:
     PUSH_CALLEE
+    
+    ; Очищаем память
     mov     ecx, 16
     xor     eax, eax
     lea     rdi, [state]
@@ -524,30 +541,46 @@ burn_memory:
     mov     ecx, 64
     lea     rdi, [pass]
     rep stosb
+    
+    ; Обнуляем счётчики
     mov     dword [pool_pos], 0
     mov     dword [cups_fill_count], 0
     mov     dword [cups_take_count], 0
-    xor     eax, eax
-    xor     ebx, ebx
-    xor     ecx, ecx
-    xor     edx, edx
-    xor     esi, esi
-    xor     edi, edi
-    xor     r8, r8
-    xor     r9, r9
+    
+    ; Очищаем ВСЕ регистры общего назначения
+    xor     rax, rax
+    xor     rbx, rbx
+    xor     rcx, rcx
+    xor     rdx, rdx
+    xor     rsi, rsi
+    xor     rdi, rdi
+    xor     rbp, rbp
+    xor     r8,  r8
+    xor     r9,  r9
     xor     r10, r10
     xor     r11, r11
-    pxor    xmm0, xmm0
-    pxor    xmm1, xmm1
-    pxor    xmm2, xmm2
-    pxor    xmm3, xmm3
-    pxor    xmm4, xmm4
-    pxor    xmm5, xmm5
-    pxor    xmm6, xmm6
-    pxor    xmm7, xmm7
-    pxor    xmm8, xmm8
-    pxor    xmm9, xmm9
+    xor     r12, r12
+    xor     r13, r13
+    xor     r14, r14
+    xor     r15, r15
+    
+    ; Очищаем ВСЕ XMM регистры
+    pxor    xmm0,  xmm0
+    pxor    xmm1,  xmm1
+    pxor    xmm2,  xmm2
+    pxor    xmm3,  xmm3
+    pxor    xmm4,  xmm4
+    pxor    xmm5,  xmm5
+    pxor    xmm6,  xmm6
+    pxor    xmm7,  xmm7
+    pxor    xmm8,  xmm8
+    pxor    xmm9,  xmm9
     pxor    xmm10, xmm10
     pxor    xmm11, xmm11
+    pxor    xmm12, xmm12
+    pxor    xmm13, xmm13
+    pxor    xmm14, xmm14
+    pxor    xmm15, xmm15
+    
     POP_CALLEE
     ret
