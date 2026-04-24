@@ -1,0 +1,32 @@
++#include "cube_entropy.h"
+
++static struct cube_state random_cube;
+
+
+// also
+
+// static void _mix_pool_bytes(const void *in, int nbytes)
+// {
+//     /* ... оригинальный код с BLAKE2s ... */
+// }
+
+// replace with
+
+// static void _mix_pool_bytes(const void *in, int nbytes)
+// {
+//     cube_mix_bytes(&random_cube, in, nbytes);
+// }
+
+// also replace this function below:
+// void get_random_bytes(void *buf, int nbytes)
+// {
+//   cube_extract_bytes(&random_cube, buf, nbytes);
+// }
+
+
+// also update this function:
+// static void rand_initialize(void)
+// {
+//     cube_entropy_init(&random_cube);
+//     /* ... остальная инициализация ... */
+// }
